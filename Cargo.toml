@@ -8,9 +8,16 @@ edition = "2021"
 [dependencies]
 crossterm = "0.27.0"
 mft = "0.6.1"
+ntfs = "0.4.0"
 ratatui = "0.25.0"
 smallvec = "1.11.2"
-windows = { version = "0.52.0", features = ["Win32_Storage_FileSystem"] }
+windows = { version = "0.52.0", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_Ioctl"
+] }
 
 [build-dependencies]
 winres = "0.1.12"
