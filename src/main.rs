@@ -1,7 +1,9 @@
+#![feature(int_roundings)]
+
 use ntfs::Ntfs;
 use std::{
     ffi::c_void,
-    io::{Read, Seek, SeekFrom},
+    io::{Error, Read, Seek, SeekFrom},
     mem::size_of,
     ops::Range,
     str::from_utf8,
@@ -9,7 +11,7 @@ use std::{
 use windows::{
     core::{w, PCWSTR},
     Win32::{
-        Foundation::{GENERIC_ACCESS_RIGHTS, GENERIC_ALL, GENERIC_READ, HANDLE},
+        Foundation::{GENERIC_READ, HANDLE},
         Storage::FileSystem::*,
         System::{
             Ioctl::{DISK_GEOMETRY, IOCTL_DISK_GET_DRIVE_GEOMETRY},
@@ -18,64 +20,105 @@ use windows::{
     },
 };
 
-static ASCII_UPPER: [char; 26] = [
-    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S',
-    'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
-];
-
-struct DiskReadSeek {
+// Win32 only handles disk IO that is sector aligned and operates on whole sectors
+struct DiskWrapper {
     handle: HANDLE,
+    virtual_file_ptr: i64,
+    read_buf: Vec<u8>,
+    geometry: DISK_GEOMETRY,
 }
 
-impl Read for DiskReadSeek {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-        println!("Read length: {}", buf.len());
-        let mut num_bytes_read = 0u32;
+impl DiskWrapper {
+    fn new(handle: HANDLE) -> Result<Self, Error> {
+        let mut geometry: DISK_GEOMETRY = Default::default();
         unsafe {
-            ReadFile(self.handle, Some(buf), Some(&mut num_bytes_read), None)?;
+            assert_eq!(GetFileType(handle), FILE_TYPE_DISK);
+
+            DeviceIoControl(
+                handle,
+                IOCTL_DISK_GET_DRIVE_GEOMETRY,
+                None,
+                0,
+                Some(&mut geometry as *mut _ as *mut c_void),
+                size_of::<DISK_GEOMETRY>() as u32,
+                None,
+                None,
+            )?;
         }
 
-        Ok(num_bytes_read as usize)
+        Ok(DiskWrapper {
+            handle,
+            virtual_file_ptr: 0,
+            read_buf: vec![0u8, 0],
+            geometry,
+        })
     }
 }
 
-impl Seek for DiskReadSeek {
-    fn seek(&mut self, pos: SeekFrom) -> Result<u64, std::io::Error> {
+impl Read for DiskWrapper {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        // println!("Read length: {}", buf.len());
+
+        let bps = self.geometry.BytesPerSector as i64;
+        let sectors = self.virtual_file_ptr / bps..(self.virtual_file_ptr + buf.len() as i64).div_ceil(bps);
+        let bytes = sectors.start * bps..sectors.end * bps;
+        let read_len = (bytes.end - bytes.start) as usize;
+
+        // println!(
+        //     "Range: {} - {} [{}] Len: {}",
+        //     bytes.start,
+        //     bytes.end,
+        //     read_len,
+        //     buf.len()
+        // );
+
+        if self.read_buf.len() < read_len {
+            self.read_buf.resize(read_len, 0);
+        }
+
+        unsafe {
+            SetFilePointerEx(self.handle, bytes.start, None, FILE_BEGIN)?;
+            ReadFile(
+                self.handle,
+                Some(&mut self.read_buf[0..read_len]),
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let vec_offs = (self.virtual_file_ptr - bytes.start) as usize;
+        buf.clone_from_slice(&self.read_buf[vec_offs..vec_offs + buf.len()]);
+        self.virtual_file_ptr += buf.len() as i64;
+
+        Ok(buf.len())
+    }
+}
+
+impl Seek for DiskWrapper {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64, Error> {
         let mut new_file_ptr = 0i64;
         unsafe {
             match pos {
-                SeekFrom::Start(offset) => SetFilePointerEx(
-                    self.handle,
-                    offset as i64,
-                    Some(&mut new_file_ptr),
-                    FILE_BEGIN,
-                ),
+                SeekFrom::Start(offset) => {
+                    self.virtual_file_ptr = offset as i64;
+                }
                 SeekFrom::End(offset) => {
-                    SetFilePointerEx(self.handle, offset, Some(&mut new_file_ptr), FILE_END)
+                    SetFilePointerEx(self.handle, 0, Some(&mut new_file_ptr), FILE_END)?;
+                    self.virtual_file_ptr = new_file_ptr + offset;
                 }
                 SeekFrom::Current(offset) => {
-                    SetFilePointerEx(self.handle, offset, Some(&mut new_file_ptr), FILE_CURRENT)
+                    self.virtual_file_ptr += offset;
                 }
-            }?;
+            };
         }
 
-        Ok(new_file_ptr as u64)
+        Ok(self.virtual_file_ptr as u64)
     }
 }
 
 fn main() {
     unsafe {
-        // println!("Mounted logical drives (from GetLogicalDrives):");
-        // let mut drive_bitmap = GetLogicalDrives();
-        // let mut drive_num = 0;
-        // while drive_bitmap != 0 {
-        //     if drive_bitmap & 1 != 0 {
-        //         println!("{}:\\", ASCII_UPPER[drive_num]);
-        //     }
-        //     drive_bitmap >>= 1;
-        //     drive_num += 1;
-        // }
-
         println!("Currently mounted logical drives (from GetLogicalDriveStringsW):");
         let mut buf = [0u16; 16384];
         let len = GetLogicalDriveStringsW(Some(&mut buf));
@@ -104,37 +147,21 @@ fn main() {
         )
         .unwrap();
 
-        match GetFileType(handle) {
-            FILE_TYPE_CHAR => println!("File type: Character file"),
-            FILE_TYPE_DISK => println!("File type: Disk file"),
-            FILE_TYPE_PIPE => println!("File type: Socket/pipe"),
-            FILE_TYPE_REMOTE => println!("File type: Unused"),
-            _ => {}
-        }
+        let mut ds = DiskWrapper::new(handle).unwrap();
 
-        let mut disk_geometry: DISK_GEOMETRY = Default::default();
-        DeviceIoControl(
-            handle,
-            IOCTL_DISK_GET_DRIVE_GEOMETRY,
-            None,
-            0,
-            Some(&mut disk_geometry as *mut _ as *mut c_void),
-            size_of::<DISK_GEOMETRY>() as u32,
-            None,
-            None,
-        )
-        .unwrap();
-
-        println!("Bytes per sector: {}", disk_geometry.BytesPerSector);
-
-        // Go to beginning of disk
-
-        // Read 8 byte system ID: "NTFS    "
-        let mut buf = vec![0u8; disk_geometry.BytesPerSector as usize];
+        // Read 8 byte system ID, should be "NTFS    "
+        let mut buf = vec![0u8; ds.geometry.BytesPerSector as usize];
         ReadFile(handle, Some(&mut buf), None, None).unwrap();
 
         println!("System ID: \"{}\"", from_utf8(&buf[3..11]).unwrap());
 
-        let ntfs = Ntfs::new(&mut DiskReadSeek { handle });
+        let ntfs = Ntfs::new(&mut ds).unwrap();
+        let label = ntfs
+            .volume_name(&mut ds)
+            .unwrap()
+            .unwrap()
+            .name()
+            .to_string();
+        println!("Volume label: {}", label.unwrap());
     }
 }
