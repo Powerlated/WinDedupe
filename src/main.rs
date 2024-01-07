@@ -1,9 +1,10 @@
 #![feature(int_roundings)]
 
-use ntfs::Ntfs;
+use ntfs::{Ntfs, KnownNtfsFileRecordNumber};
 use std::{
+    *,
     ffi::c_void,
-    io::{Error, Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom},
     mem::size_of,
     ops::Range,
     str::from_utf8,
@@ -29,7 +30,7 @@ struct DiskWrapper {
 }
 
 impl DiskWrapper {
-    fn new(handle: HANDLE) -> Result<Self, Error> {
+    fn new(handle: HANDLE) -> Result<Self, io::Error> {
         let mut geometry: DISK_GEOMETRY = Default::default();
         unsafe {
             assert_eq!(GetFileType(handle), FILE_TYPE_DISK);
@@ -56,7 +57,7 @@ impl DiskWrapper {
 }
 
 impl Read for DiskWrapper {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
         // println!("Read length: {}", buf.len());
 
         let bps = self.geometry.BytesPerSector as i64;
@@ -83,8 +84,7 @@ impl Read for DiskWrapper {
                 Some(&mut self.read_buf[0..read_len]),
                 None,
                 None,
-            )
-            .unwrap();
+            )?;
         }
 
         let vec_offs = (self.virtual_file_ptr - bytes.start) as usize;
@@ -96,7 +96,7 @@ impl Read for DiskWrapper {
 }
 
 impl Seek for DiskWrapper {
-    fn seek(&mut self, pos: SeekFrom) -> Result<u64, Error> {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64, io::Error> {
         let mut new_file_ptr = 0i64;
         unsafe {
             match pos {
@@ -117,7 +117,7 @@ impl Seek for DiskWrapper {
     }
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn error::Error>> {
     unsafe {
         println!("Currently mounted logical drives (from GetLogicalDriveStringsW):");
         let mut buf = [0u16; 16384];
@@ -126,11 +126,10 @@ fn main() {
             .get(Range {
                 start: 0,
                 end: (len * 2) as usize,
-            })
-            .unwrap();
+            }).unwrap();
         for i in buf.split(|b| *b == 0u16) {
             if i.len() > 0 {
-                println!("{}", String::from_utf16(i).unwrap());
+                println!("{}", String::from_utf16(i)?);
             }
         }
 
@@ -144,24 +143,27 @@ fn main() {
             OPEN_EXISTING,
             FILE_FLAGS_AND_ATTRIBUTES(0),
             None,
-        )
-        .unwrap();
+        )?;
 
-        let mut ds = DiskWrapper::new(handle).unwrap();
+        let mut ds = DiskWrapper::new(handle)?;
 
         // Read 8 byte system ID, should be "NTFS    "
         let mut buf = vec![0u8; ds.geometry.BytesPerSector as usize];
-        ReadFile(handle, Some(&mut buf), None, None).unwrap();
+        ReadFile(handle, Some(&mut buf), None, None)?;
 
-        println!("System ID: \"{}\"", from_utf8(&buf[3..11]).unwrap());
+        println!("System ID: \"{}\"", from_utf8(&buf[3..11])?);
 
-        let ntfs = Ntfs::new(&mut ds).unwrap();
+        let ntfs = Ntfs::new(&mut ds)?;
         let label = ntfs
             .volume_name(&mut ds)
-            .unwrap()
-            .unwrap()
+            .unwrap()?
             .name()
             .to_string();
-        println!("Volume label: {}", label.unwrap());
+
+        println!("Volume label: {}", label?);
+
+        // ntfs.file(&mut ntfs, KnownNtfsFileRecordNumber::MFT)?.data(fs, data_stream_name)
     }
+
+    Ok(())
 }
