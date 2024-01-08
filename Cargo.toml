@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 crossterm = "0.27.0"
 mft = { git = "https://github.com/omerbenamram/mft", rev = "6767bb5" }
+multimap = "0.9.1"
 ntfs = "0.4.0"
 ratatui = "0.25.0"
 smallvec = "1.11.2"

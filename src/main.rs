@@ -1,15 +1,16 @@
 #![feature(int_roundings)]
 
+use mft::attribute::header::ResidentialHeader::*;
+use mft::attribute::x30::FileNamespace::DOS;
 use mft::{
-    attribute::{x30::FileNamespace, FileAttributeFlags, MftAttributeContent, MftAttributeType},
+    attribute::{MftAttributeContent, MftAttributeType},
     MftParser,
 };
+use multimap::MultiMap;
 use ntfs::{attribute_value::NtfsAttributeValue, KnownNtfsFileRecordNumber::*, Ntfs, NtfsReadSeek};
 use std::{
-    backtrace::Backtrace,
     ffi::c_void,
-    fs::{File, OpenOptions},
-    io::{BufReader, Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom},
     mem::size_of,
     ops::Range,
     str::from_utf8,
@@ -18,7 +19,7 @@ use std::{
 use windows::{
     core::{w, PCWSTR},
     Win32::{
-        Foundation::{CloseHandle, GENERIC_READ, HANDLE},
+        Foundation::{GENERIC_READ, HANDLE},
         Storage::FileSystem::*,
         System::{
             Ioctl::{DISK_GEOMETRY, IOCTL_DISK_GET_DRIVE_GEOMETRY},
@@ -79,13 +80,12 @@ impl Read for DiskReader {
         }
 
         match self.read_buf_ptr {
-            Some(p) => {}
+            Some(_) => {}
             None => unsafe {
                 let bps = self.geometry.BytesPerSector as i64;
                 // round down to lower sector
                 let read_start = self.virtual_file_ptr / bps * bps;
                 let read_len = self.read_buf.len();
-                let read_bytes = read_start..read_start + read_len as i64;
 
                 // println!(
                 // "Buffered read: {} - {} [{}]",
@@ -203,39 +203,91 @@ fn main() -> Result<(), Box<dyn error::Error>> {
 
         println!("MFT size: {}", mft_data_value.len());
 
-        let mut f = File::create("filenames.txt")?;
-
         let mut read_seek = ReadSeekNtfsAttributeValue(&mut disk, mft_data_value);
         let mut mft = MftParser::from_read_seek(&mut read_seek, None)?;
-        let mut root = mft.get_entry(RootDirectory as u64)?;
         let mut num_entries = 0;
+        let mut parent_map = MultiMap::<u64, u64>::new();
         for er in mft.iter_entries() {
             let e = er?;
             // Files with inode > 24 are ordinary files/directories
             if e.header.record_number > 24 {
+                let mut parent_ref: Option<u64> = None;
                 for a in e
                     .iter_attributes_matching(Some(vec![MftAttributeType::FileName]))
                     .filter_map(|attr| attr.ok())
                 {
                     match a.data {
                         MftAttributeContent::AttrX30(a) => {
-                            if a.parent.entry == RootDirectory as u64 {
-                                if a.namespace == FileNamespace::Win32
-                                    || a.namespace == FileNamespace::Win32AndDos
-                                {
-                                    f.write_all(format!("{}\n", a.name).as_bytes())?;
-                                    println!("{} [{:#x}]", a.name, a.flags);
-                                }
-                            }
+                            parent_ref = Some(a.parent.entry);
                         }
                         _ => {}
                     }
                 }
+
+                if parent_ref.is_some() {
+                    parent_map.insert(parent_ref.unwrap(), e.header.record_number);
+                }
+
                 num_entries += 1;
             }
         }
 
         println!("Entries in MFT: {}", num_entries);
+
+        let root_leaves = parent_map.get_vec(&(RootDirectory as u64)).unwrap();
+        for i in root_leaves {
+            let e = mft.get_entry(*i)?;
+
+            let mut name: Option<String> = None;
+            let mut is_dir = false;
+            let mut size = 0u64;
+            let mut allocated = 0u64;
+
+            for attr in e.iter_attributes().filter_map(|attr| attr.ok()) {
+                // Data (AttrX80) can be non-resident if it is too big for the MFT entry
+                match attr.header.type_code {
+                    MftAttributeType::DATA => {
+                        match attr.header.residential_header {
+                            Resident(h) => {
+                                size = h.data_size as u64;
+                                allocated = h.data_size as u64;
+                            }
+                            NonResident(h) => {
+                                // mft crate docs say that valid_data_length and allocated_length are invalid if vcn_first != 0
+                                assert_eq!(h.vnc_first, 0);
+                                size = h.file_size;
+                                // When a file is compressed, allocated_length is an even multiple of the compression unit size rather than the cluster size.
+                                allocated = h.allocated_length;
+                                // Compression unit size = 2^x clusters
+                                // println!("Compression unit size (bytes): {}", 2u32.pow(h.unit_compression_size as u32) * fs.cluster_size());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+
+                // Filename (AttrX30) is always resident so we are fine here
+                match attr.data {
+                    MftAttributeContent::AttrX30(a) => {
+                        if a.namespace != DOS {
+                            name = Some(a.name);
+                            is_dir = e.is_dir();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if name.is_some() {
+                println!(
+                    "{}{} {} {}",
+                    name.unwrap(),
+                    if is_dir { "/" } else { "" },
+                    size,
+                    allocated
+                );
+            }
+        }
     }
 
     Ok(())

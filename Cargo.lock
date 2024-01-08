@@ -704,6 +704,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "multimap"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1a5d38b9b352dbd913288736af36af41c48d61b1a8cd34bcecd727561b7d511"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "nt-string"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1328,6 +1337,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "mft",
+ "multimap",
  "ntfs",
  "ratatui",
  "smallvec",
