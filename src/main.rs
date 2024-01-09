@@ -8,6 +8,9 @@ use mft::{
 };
 use multimap::MultiMap;
 use ntfs::{attribute_value::NtfsAttributeValue, KnownNtfsFileRecordNumber::*, Ntfs, NtfsReadSeek};
+use std::collections::HashSet;
+use std::fs::File;
+use std::io::{Write, BufWriter};
 use std::{
     ffi::c_void,
     io::{Read, Seek, SeekFrom},
@@ -27,6 +30,19 @@ use windows::{
         },
     },
 };
+
+// An struct storing the bare minimum needed for this program to work
+#[derive(Clone)]
+struct FileMetadata {
+    name: Option<String>,
+    index: u64,
+    // Because hard links exist, a file can have multiple parent directories
+    parent_indices: HashSet<u64>,
+    is_dir: bool,
+    file_size: u64,
+    allocated_size: u64,
+    children_indices: HashSet<u64>,
+}
 
 // Win32 only handles disk IO that is sector aligned and operates on whole sectors
 struct DiskReader {
@@ -190,6 +206,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
         ReadFile(disk_handle, Some(&mut buf), None, None)?;
 
         println!("System ID: \"{}\"", from_utf8(&buf[3..11])?);
+        assert_eq!(from_utf8(&buf[3..11])?, "NTFS    ");
 
         let fs = Ntfs::new(&mut disk)?;
         let label = fs.volume_name(&mut disk).unwrap()?.name().to_string();
@@ -205,59 +222,47 @@ fn main() -> Result<(), Box<dyn error::Error>> {
 
         let mut read_seek = ReadSeekNtfsAttributeValue(&mut disk, mft_data_value);
         let mut mft = MftParser::from_read_seek(&mut read_seek, None)?;
-        let mut num_entries = 0;
-        let mut parent_map = MultiMap::<u64, u64>::new();
-        for er in mft.iter_entries() {
+        println!("File count: {}", mft.get_entry_count());
+        let mut file_metadata = vec![None::<FileMetadata>; mft.get_entry_count() as usize];
+        // let mut filenames_txt = BufWriter::new(File::create("filenames.txt")?);
+        println!("Loading file metadata...");
+        for (index, er) in mft.iter_entries().enumerate() {
             let e = er?;
+
             // Files with inode > 24 are ordinary files/directories
-            if e.header.record_number > 24 {
-                let mut parent_ref: Option<u64> = None;
-                for a in e
-                    .iter_attributes_matching(Some(vec![MftAttributeType::FileName]))
-                    .filter_map(|attr| attr.ok())
-                {
-                    match a.data {
-                        MftAttributeContent::AttrX30(a) => {
-                            parent_ref = Some(a.parent.entry);
-                        }
-                        _ => {}
-                    }
-                }
-
-                if parent_ref.is_some() {
-                    parent_map.insert(parent_ref.unwrap(), e.header.record_number);
-                }
-
-                num_entries += 1;
-            }
-        }
-
-        println!("Entries in MFT: {}", num_entries);
-
-        let root_leaves = parent_map.get_vec(&(RootDirectory as u64)).unwrap();
-        for i in root_leaves {
-            let e = mft.get_entry(*i)?;
-
-            let mut name: Option<String> = None;
+            let mut name = None::<String>;
+            let mut parent_indices = HashSet::new();
             let mut is_dir = false;
-            let mut size = 0u64;
-            let mut allocated = 0u64;
+            let mut file_size = 0u64;
+            let mut allocated_size = 0u64;
+            let children_indices = HashSet::new();
 
-            for attr in e.iter_attributes().filter_map(|attr| attr.ok()) {
+            for a in e.iter_attributes().filter_map(|attr| attr.ok()) {
+                // Filename (AttrX30) is always resident so we are fine here
+                match a.data {
+                    MftAttributeContent::AttrX30(a) => {
+                        parent_indices.insert(a.parent.entry);
+                        // filenames_txt.write_fmt(format_args!("i:{} p:{} {}\n", index, a.parent.entry, a.name)).expect("Unable to write data");
+                        name = Some(a.name);
+                        is_dir = e.is_dir();
+                    }
+                    _ => {}
+                }
+
                 // Data (AttrX80) can be non-resident if it is too big for the MFT entry
-                match attr.header.type_code {
+                match a.header.type_code {
                     MftAttributeType::DATA => {
-                        match attr.header.residential_header {
+                        match a.header.residential_header {
                             Resident(h) => {
-                                size = h.data_size as u64;
-                                allocated = h.data_size as u64;
+                                file_size = h.data_size as u64;
+                                allocated_size = h.data_size as u64;
                             }
                             NonResident(h) => {
                                 // mft crate docs say that valid_data_length and allocated_length are invalid if vcn_first != 0
-                                assert_eq!(h.vnc_first, 0);
-                                size = h.file_size;
+                                // assert_eq!(h.vnc_first, 0);
+                                file_size = h.file_size;
                                 // When a file is compressed, allocated_length is an even multiple of the compression unit size rather than the cluster size.
-                                allocated = h.allocated_length;
+                                allocated_size = h.allocated_length;
                                 // Compression unit size = 2^x clusters
                                 // println!("Compression unit size (bytes): {}", 2u32.pow(h.unit_compression_size as u32) * fs.cluster_size());
                             }
@@ -265,29 +270,51 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                     }
                     _ => {}
                 }
+            }
 
-                // Filename (AttrX30) is always resident so we are fine here
-                match attr.data {
-                    MftAttributeContent::AttrX30(a) => {
-                        if a.namespace != DOS {
-                            name = Some(a.name);
-                            is_dir = e.is_dir();
-                        }
-                    }
-                    _ => {}
+            file_metadata[index as usize] = Some(FileMetadata {
+                name,
+                index: index as u64,
+                parent_indices,
+                is_dir,
+                file_size,
+                allocated_size,
+                children_indices,
+            });
+        }
+
+        println!("Building tree...");
+        // Build tree by linking parent directories to their children
+        for i in 0..file_metadata.len() {
+            if file_metadata[i].is_some() {
+                let fm = &file_metadata[i];
+                for parent_index in fm.clone().unwrap().parent_indices.iter() {
+                    file_metadata[*parent_index as usize]
+                    .as_mut()
+                    .unwrap()
+                    .children_indices
+                    .insert(i as u64);
                 }
             }
-
-            if name.is_some() {
-                println!(
-                    "{}{} {} {}",
-                    name.unwrap(),
-                    if is_dir { "/" } else { "" },
-                    size,
-                    allocated
-                );
-            }
         }
+
+        let list_dir = |index: u64| {
+            if let Some(file) = &file_metadata[index as usize] {
+                for i in &file.children_indices {
+                    // Files with inode > 24 are ordinary files/directories
+                    let child = file_metadata[*i as usize].as_ref().unwrap();
+                    if *i > 24 {
+                        println!("{} {}", child.index, child.name.as_ref().unwrap());
+                    }
+                }
+            }
+        };
+
+        list_dir(1044);
+
+        println!("Entries in MFT: {}", file_metadata.len());
+
+        loop {}
     }
 
     Ok(())
