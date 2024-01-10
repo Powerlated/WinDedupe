@@ -10,7 +10,7 @@ use multimap::MultiMap;
 use ntfs::{attribute_value::NtfsAttributeValue, KnownNtfsFileRecordNumber::*, Ntfs, NtfsReadSeek};
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{Write, BufWriter};
+use std::io::{BufWriter, Write};
 use std::{
     ffi::c_void,
     io::{Read, Seek, SeekFrom},
@@ -19,6 +19,7 @@ use std::{
     str::from_utf8,
     *,
 };
+use windows::Win32::Foundation::CloseHandle;
 use windows::{
     core::{w, PCWSTR},
     Win32::{
@@ -85,7 +86,7 @@ impl Read for DiskReader {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
         // println!("Read length: {}", buf.len());
 
-        // Invalidate buffer if new read lands outside of it
+        // Invalidate buffer if new read exceeds its boundaries
         if let Some(p) = self.read_buf_ptr {
             if self.virtual_file_ptr < p {
                 self.read_buf_ptr = None;
@@ -171,6 +172,9 @@ where
 }
 
 fn main() -> Result<(), Box<dyn error::Error>> {
+    let path: PCWSTR = w!(r"\\.\C:");
+    let mut file_metadata: Vec<Option<FileMetadata>>;
+
     unsafe {
         println!("Currently mounted logical drives (from GetLogicalDriveStringsW):");
         let mut buf = [0u16; 16384];
@@ -186,8 +190,6 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                 println!("{}", String::from_utf16(i)?);
             }
         }
-
-        let path: PCWSTR = w!(r"\\.\C:");
 
         let disk_handle = CreateFileW(
             path,
@@ -222,8 +224,8 @@ fn main() -> Result<(), Box<dyn error::Error>> {
 
         let mut read_seek = ReadSeekNtfsAttributeValue(&mut disk, mft_data_value);
         let mut mft = MftParser::from_read_seek(&mut read_seek, None)?;
+        file_metadata = vec![None::<FileMetadata>; mft.get_entry_count() as usize];
         println!("File count: {}", mft.get_entry_count());
-        let mut file_metadata = vec![None::<FileMetadata>; mft.get_entry_count() as usize];
         // let mut filenames_txt = BufWriter::new(File::create("filenames.txt")?);
         println!("Loading file metadata...");
         for (index, er) in mft.iter_entries().enumerate() {
@@ -239,6 +241,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
 
             for a in e.iter_attributes().filter_map(|attr| attr.ok()) {
                 // Filename (AttrX30) is always resident so we are fine here
+                // If a file has hard links it has multiple filename attributes
                 match a.data {
                     MftAttributeContent::AttrX30(a) => {
                         parent_indices.insert(a.parent.entry);
@@ -283,39 +286,46 @@ fn main() -> Result<(), Box<dyn error::Error>> {
             });
         }
 
-        println!("Building tree...");
-        // Build tree by linking parent directories to their children
-        for i in 0..file_metadata.len() {
-            if file_metadata[i].is_some() {
-                let fm = &file_metadata[i];
-                for parent_index in fm.clone().unwrap().parent_indices.iter() {
-                    file_metadata[*parent_index as usize]
+        CloseHandle(disk_handle)?;
+    }
+
+    println!("Building tree...");
+    // Build tree by linking parent directories to their children
+    for i in 0..file_metadata.len() {
+        if file_metadata[i].is_some() {
+            let fm = &file_metadata[i];
+            for parent_index in fm.clone().unwrap().parent_indices.iter() {
+                file_metadata[*parent_index as usize]
                     .as_mut()
                     .unwrap()
                     .children_indices
                     .insert(i as u64);
+            }
+        }
+    }
+
+    let list_dir = |index: u64| {
+        if let Some(file) = &file_metadata[index as usize] {
+            for i in &file.children_indices {
+                // Files with inode > 24 are ordinary files/directories
+                let child = file_metadata[*i as usize].as_ref().unwrap();
+                if *i > 24 {
+                    println!(
+                        "i:{} {}{}",
+                        child.index,
+                        child.name.as_ref().unwrap(),
+                        if child.is_dir { "/" } else { "" }
+                    );
                 }
             }
         }
+    };
 
-        let list_dir = |index: u64| {
-            if let Some(file) = &file_metadata[index as usize] {
-                for i in &file.children_indices {
-                    // Files with inode > 24 are ordinary files/directories
-                    let child = file_metadata[*i as usize].as_ref().unwrap();
-                    if *i > 24 {
-                        println!("{} {}", child.index, child.name.as_ref().unwrap());
-                    }
-                }
-            }
-        };
+    list_dir(2807);
 
-        list_dir(1044);
+    println!("Entries in MFT: {}", file_metadata.len());
 
-        println!("Entries in MFT: {}", file_metadata.len());
-
-        loop {}
-    }
+    loop {}
 
     Ok(())
 }

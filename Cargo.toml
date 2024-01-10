@@ -22,3 +22,9 @@ windows = { version = "0.52.0", features = [
 
 [build-dependencies]
 winres = "0.1.12"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
