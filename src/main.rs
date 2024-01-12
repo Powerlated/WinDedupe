@@ -1,196 +1,126 @@
 #![feature(int_roundings)]
+#![feature(iter_collect_into)]
+mod win_dedupe;
+
+use cursive::event::Event;
+use cursive::theme::{BorderStyle, Palette};
+use cursive::traits::With;
+use cursive::views::{Button, Dialog, DummyView, LinearLayout, SelectView, TextView};
+use cursive::{Cursive, CursiveExt};
 
 use mft::attribute::header::ResidentialHeader::*;
-use mft::attribute::x30::FileNamespace::DOS;
+
 use mft::{
     attribute::{MftAttributeContent, MftAttributeType},
     MftParser,
 };
-use multimap::MultiMap;
-use ntfs::{attribute_value::NtfsAttributeValue, KnownNtfsFileRecordNumber::*, Ntfs, NtfsReadSeek};
+
+use ntfs::{KnownNtfsFileRecordNumber::*, Ntfs};
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::{
-    ffi::c_void,
-    io::{Read, Seek, SeekFrom},
-    mem::size_of,
-    ops::Range,
-    str::from_utf8,
-    *,
-};
+
+use std::ffi::CString;
+use std::slice::Split;
+use std::string::FromUtf16Error;
+use std::{ops::Range, str::from_utf8, *};
 use windows::Win32::Foundation::CloseHandle;
 use windows::{
     core::{w, PCWSTR},
-    Win32::{
-        Foundation::{GENERIC_READ, HANDLE},
-        Storage::FileSystem::*,
-        System::{
-            Ioctl::{DISK_GEOMETRY, IOCTL_DISK_GET_DRIVE_GEOMETRY},
-            IO::DeviceIoControl,
-        },
-    },
+    Win32::{Foundation::GENERIC_READ, Storage::FileSystem::*},
 };
 
-// An struct storing the bare minimum needed for this program to work
-#[derive(Clone)]
-struct FileMetadata {
-    name: Option<String>,
-    index: u64,
-    // Because hard links exist, a file can have multiple parent directories
-    parent_indices: HashSet<u64>,
-    is_dir: bool,
-    file_size: u64,
-    allocated_size: u64,
-    children_indices: HashSet<u64>,
-}
-
-// Win32 only handles disk IO that is sector aligned and operates on whole sectors
-struct DiskReader {
-    handle: HANDLE,
-    virtual_file_ptr: i64,
-    read_buf_ptr: Option<i64>,
-    read_buf: Vec<u8>,
-    geometry: DISK_GEOMETRY,
-}
-
-impl DiskReader {
-    fn new(handle: HANDLE) -> Result<Self, io::Error> {
-        let mut geometry: DISK_GEOMETRY = Default::default();
-        unsafe {
-            assert_eq!(GetFileType(handle), FILE_TYPE_DISK);
-
-            DeviceIoControl(
-                handle,
-                IOCTL_DISK_GET_DRIVE_GEOMETRY,
-                None,
-                0,
-                Some(&mut geometry as *mut _ as *mut c_void),
-                size_of::<DISK_GEOMETRY>() as u32,
-                None,
-                None,
-            )?;
-        }
-
-        Ok(DiskReader {
-            handle,
-            virtual_file_ptr: 0,
-            read_buf: vec![0u8; 2usize.pow(22)], // 4 MB buffer size
-            read_buf_ptr: None,
-            geometry,
-        })
-    }
-}
-
-impl Read for DiskReader {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
-        // println!("Read length: {}", buf.len());
-
-        // Invalidate buffer if new read exceeds its boundaries
-        if let Some(p) = self.read_buf_ptr {
-            if self.virtual_file_ptr < p {
-                self.read_buf_ptr = None;
-            }
-            if self.virtual_file_ptr + buf.len() as i64 >= p + self.read_buf.len() as i64 {
-                self.read_buf_ptr = None;
-            }
-        }
-
-        match self.read_buf_ptr {
-            Some(_) => {}
-            None => unsafe {
-                let bps = self.geometry.BytesPerSector as i64;
-                // round down to lower sector
-                let read_start = self.virtual_file_ptr / bps * bps;
-                let read_len = self.read_buf.len();
-
-                // println!(
-                // "Buffered read: {} - {} [{}]",
-                // read_bytes.start, read_bytes.end, read_len,
-                // );
-
-                SetFilePointerEx(self.handle, read_start, None, FILE_BEGIN)?;
-                ReadFile(
-                    self.handle,
-                    Some(&mut self.read_buf[0..read_len]),
-                    None,
-                    None,
-                )?;
-
-                self.read_buf_ptr = Some(read_start);
-            },
-        }
-
-        let vec_offs = (self.virtual_file_ptr - self.read_buf_ptr.unwrap()) as usize;
-        buf.clone_from_slice(&self.read_buf[vec_offs..vec_offs + buf.len()]);
-        self.virtual_file_ptr += buf.len() as i64;
-
-        Ok(buf.len())
-    }
-}
-
-impl Seek for DiskReader {
-    fn seek(&mut self, pos: SeekFrom) -> Result<u64, io::Error> {
-        let mut new_file_ptr = 0i64;
-        unsafe {
-            match pos {
-                SeekFrom::Start(offset) => {
-                    self.virtual_file_ptr = offset as i64;
-                }
-                SeekFrom::End(offset) => {
-                    SetFilePointerEx(self.handle, 0, Some(&mut new_file_ptr), FILE_END)?;
-                    self.virtual_file_ptr = new_file_ptr + offset;
-                }
-                SeekFrom::Current(offset) => {
-                    self.virtual_file_ptr += offset;
-                }
-            };
-        }
-
-        Ok(self.virtual_file_ptr as u64)
-    }
-}
-
-struct ReadSeekNtfsAttributeValue<'a, T>(&'a mut T, NtfsAttributeValue<'a, 'a>);
-
-impl<T> Read for ReadSeekNtfsAttributeValue<'_, T>
-where
-    T: Read + Seek,
-{
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        Ok(self.1.read(&mut self.0, buf)?)
-    }
-}
-
-impl<T> Seek for ReadSeekNtfsAttributeValue<'_, T>
-where
-    T: Read + Seek,
-{
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        Ok(self.1.seek(&mut self.0, pos)?)
-    }
-}
+use crate::win_dedupe::{DiskReader, FileMetadata, ReadSeekNtfsAttributeValue};
 
 fn main() -> Result<(), Box<dyn error::Error>> {
+    println!("{:#?}", get_logical_volumes());
+
+    let mut siv = Cursive::new();
+
+    // Start with a nicer theme than default
+    siv.set_theme(cursive::theme::Theme {
+        shadow: false,
+        borders: BorderStyle::Simple,
+        palette: Palette::retro().with(|palette| {
+            use cursive::theme::BaseColor::*;
+            {
+                // First, override some colors from the base palette.
+                use cursive::theme::Color::TerminalDefault;
+                use cursive::theme::PaletteColor::*;
+
+                palette[Background] = TerminalDefault;
+                palette[View] = TerminalDefault;
+                palette[Primary] = White.dark();
+                palette[TitlePrimary] = Blue.light();
+                palette[Secondary] = Blue.light();
+                palette[Highlight] = Blue.dark();
+            }
+
+            {
+                // Then override some styles.
+                use cursive::theme::Effect::*;
+                use cursive::theme::PaletteStyle::*;
+                use cursive::theme::Style;
+                palette[Highlight] = Style::from(Blue.light()).combine(Bold).combine(Reverse);
+                palette[EditableTextCursor] = Style::secondary().combine(Reverse).combine(Underline)
+            }
+        }),
+    });
+
+    let buttons = LinearLayout::vertical()
+        .child(TextView::new(
+"WinDedupe is an application for finding and removing duplicate files on Windows machines.
+
+WinDedupe accelerates search by reading the Master File Table of NTFS-formatted volumes.
+Finding duplicate files on other filesystems is slower.
+
+Select an option:"
+    ))
+        .child(Button::new("Find duplicate files", deduplicate_files_menu))
+        .child(Button::new("Explore volumes", explore_volumes_menu))
+        .child(DummyView)
+        .child(Button::new("Quit", Cursive::quit));
+
+    siv.add_layer(Dialog::around(buttons).title("Welcome to WinDedupe!"));
+
+    siv.add_global_callback(Event::CtrlChar('c'), Cursive::quit);
+
+    siv.run();
+
+    Ok(())
+}
+
+fn deduplicate_files_menu(s: &mut Cursive) {}
+
+fn explore_a_volume_menu(s: &mut Cursive, volume: &str) {}
+
+fn explore_volumes_menu(s: &mut Cursive) {
+    let mut select = SelectView::<String>::new().on_submit(explore_a_volume_menu);
+
+    select.add_all_str(get_logical_volumes());
+    println!("{:#?}", get_logical_volumes());
+
+    s.pop_layer();
+    s.add_layer(Dialog::around(select).title("Select a Volume"));
+}
+
+fn get_logical_volumes() -> Vec<String> {
+    let mut buf;
+    unsafe {
+        buf = vec![0u16; GetLogicalDriveStringsW(None) as usize];
+        GetLogicalDriveStringsW(Some(&mut buf));
+    }
+
+    // split buffer by nulls
+    buf.split(|b| *b == 0u16)
+        .filter(|f| f.len() > 0)
+        .map(|f| String::from_utf16(f).unwrap())
+        .collect()
+}
+
+fn mft_list_dir_test() -> Result<(), Box<dyn error::Error>> {
     let path: PCWSTR = w!(r"\\.\C:");
     let mut file_metadata: Vec<Option<FileMetadata>>;
 
     unsafe {
-        println!("Currently mounted logical drives (from GetLogicalDriveStringsW):");
-        let mut buf = [0u16; 16384];
-        let len = GetLogicalDriveStringsW(Some(&mut buf));
-        let buf = buf
-            .get(Range {
-                start: 0,
-                end: (len * 2) as usize,
-            })
-            .unwrap();
-        for i in buf.split(|b| *b == 0u16) {
-            if i.len() > 0 {
-                println!("{}", String::from_utf16(i)?);
-            }
-        }
-
         let disk_handle = CreateFileW(
             path,
             GENERIC_READ.0,
@@ -324,8 +254,6 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     list_dir(2807);
 
     println!("Entries in MFT: {}", file_metadata.len());
-
-    loop {}
 
     Ok(())
 }
