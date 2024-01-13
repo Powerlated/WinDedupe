@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     println!("Opening raw volume: \"{}\"...", path);
     let mut reader = VolumeReader::open_path(path)?;
     println!("Reading file metadata from MFT and building index...");
-    let index = VolumeIndexFlatArray::from(&mut reader)?;
+    let index = VolumeIndexFlatArray::from(&mut reader, None)?;
     println!("Building tree...");
     let index = index.build_tree();
 

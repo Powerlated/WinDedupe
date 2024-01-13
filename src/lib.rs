@@ -9,20 +9,19 @@ use std::{
 use std::error::Error;
 use std::io::SeekFrom::Start;
 use std::str::from_utf8;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use mft::attribute::{MftAttributeContent, MftAttributeType};
 use mft::attribute::header::ResidentialHeader::{NonResident, Resident};
 use mft::MftParser;
 use ntfs::KnownNtfsFileRecordNumber::MFT;
-use windows::core::{PCWSTR, w};
-use windows::Win32::{
-    Foundation::HANDLE,
-    Storage::FileSystem::*,
-    System::{
-        Ioctl::{DISK_GEOMETRY, IOCTL_DISK_GET_DRIVE_GEOMETRY},
-        IO::DeviceIoControl,
-    },
-};
-use windows::Win32::Foundation::{CloseHandle, GENERIC_READ};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE};
+use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_BEGIN, FILE_END, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, GetFileType, OPEN_EXISTING, ReadFile, SetFilePointerEx};
+use windows::Win32::System::IO::DeviceIoControl;
+use windows::Win32::System::Ioctl::{DISK_GEOMETRY, IOCTL_DISK_GET_DRIVE_GEOMETRY};
+use winsafe::{File, FileAccess};
+use winsafe::FileAccess::{CreateRW, ExistingReadOnly};
 
 // An struct storing the bare minimum needed for this program to work
 #[derive(Clone)]
@@ -190,34 +189,32 @@ impl<T> Seek for ReadSeekNtfsAttributeValue<'_, T>
     }
 }
 
+fn verify_ntfs_system_id(reader: &mut VolumeReader) -> bool {
+    // Read 8 byte system ID, should be "NTFS    "
+    let mut buf = [0u8; 8];
+    reader.seek(Start(3)).unwrap();
+    reader.read_exact(&mut buf).unwrap();
+    from_utf8(&buf).unwrap() == "NTFS    "
+}
+
 pub struct VolumeIndexFlatArray(pub Vec<Option<FileMetadata>>);
 
 impl VolumeIndexFlatArray {
-    pub fn from(reader: &mut VolumeReader) -> Result<Self, Box<dyn Error>> {
+    pub fn from(reader: &mut VolumeReader, progress_counter: Option<Arc<AtomicUsize>>) -> Result<Self, Box<dyn Error>> {
         let mut file_metadata: Vec<Option<FileMetadata>>;
 
         unsafe {
-            // Read 8 byte system ID, should be "NTFS    "
-            let mut buf = [0u8; 8];
-            reader.seek(Start(3))?;
-            reader.read_exact(&mut buf)?;
-            assert_eq!(from_utf8(&buf)?, "NTFS    ");
+            assert!(verify_ntfs_system_id(reader));
 
             let fs = Ntfs::new(reader)?;
-            let label = fs.volume_name(reader).unwrap()?.name().to_string();
-
-            // println!("Volume label: {}", label?);
-
             let file = fs.file(reader, MFT as u64)?;
             let data = file.data(reader, "").unwrap()?;
             let data_attr = data.to_attribute()?;
             let mft_data_value = data_attr.value(reader)?;
-
-            // println!("MFT size: {}", mft_data_value.len());
-
             let mut read_seek = ReadSeekNtfsAttributeValue(reader, mft_data_value);
             let mut mft = MftParser::from_read_seek(&mut read_seek, None)?;
-            file_metadata = vec![None::<FileMetadata>; mft.get_entry_count() as usize];
+            let entry_count = mft.get_entry_count();
+            file_metadata = vec![None::<FileMetadata>; entry_count as usize];
 
             for (index, er) in mft.iter_entries().enumerate() {
                 let e = er?;
@@ -236,7 +233,6 @@ impl VolumeIndexFlatArray {
                     match a.data {
                         MftAttributeContent::AttrX30(a) => {
                             parent_indices.insert(a.parent.entry);
-                            // filenames_txt.write_fmt(format_args!("i:{} p:{} {}\n", index, a.parent.entry, a.name)).expect("Unable to write data");
                             name = Some(a.name);
                             is_dir = e.is_dir();
                         }
@@ -275,8 +271,14 @@ impl VolumeIndexFlatArray {
                     allocated_size,
                     children_indices,
                 });
-            }
 
+                // Send progress update for every percentage
+                if index % (entry_count / 100) as usize == 0 {
+                    if let Some(ref progress_counter) = progress_counter {
+                        progress_counter.store(index, Ordering::Relaxed);
+                    }
+                }
+            }
         }
 
         Ok(VolumeIndexFlatArray(file_metadata))
@@ -300,4 +302,17 @@ impl VolumeIndexFlatArray {
         VolumeIndexTree(self.0)
     }
 }
+
 pub struct VolumeIndexTree(pub Vec<Option<FileMetadata>>);
+
+pub fn get_mft_entry_count(reader: &mut VolumeReader) -> Result<u64, Box<dyn Error>> {
+    let fs = Ntfs::new(reader)?;
+    let file = fs.file(reader, MFT as u64)?;
+    let data = file.data(reader, "").unwrap()?;
+    let data_attr = data.to_attribute()?;
+    let mft_data_value = data_attr.value(reader)?;
+    let mut read_seek = ReadSeekNtfsAttributeValue(reader, mft_data_value);
+    let mut mft = MftParser::from_read_seek(&mut read_seek, None)?;
+
+    Ok(mft.get_entry_count())
+}
