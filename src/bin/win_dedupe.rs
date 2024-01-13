@@ -27,10 +27,10 @@ fn main() -> Result<(), Box<dyn error::Error>> {
 
                 palette[Background] = TerminalDefault;
                 palette[View] = TerminalDefault;
-                palette[Primary] = White.dark();
+                palette[Primary] = White.light();
                 palette[TitlePrimary] = Blue.light();
                 palette[Secondary] = Blue.light();
-                palette[Highlight] = Blue.dark();
+                palette[Highlight] = Blue.light();
             }
 
             {
