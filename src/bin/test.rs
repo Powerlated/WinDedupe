@@ -1,122 +1,17 @@
-#![feature(int_roundings)]
-#![feature(iter_collect_into)]
-mod win_dedupe;
-
-use cursive::event::Event;
-use cursive::theme::{BorderStyle, Palette};
-use cursive::traits::With;
-use cursive::views::{Button, Dialog, DummyView, LinearLayout, SelectView, TextView};
-use cursive::{Cursive, CursiveExt};
-
-use mft::attribute::header::ResidentialHeader::*;
-
-use mft::{
-    attribute::{MftAttributeContent, MftAttributeType},
-    MftParser,
-};
-
-use ntfs::{KnownNtfsFileRecordNumber::*, Ntfs};
 use std::collections::HashSet;
-
-use std::ffi::CString;
-use std::slice::Split;
-use std::string::FromUtf16Error;
-use std::{ops::Range, str::from_utf8, *};
-use windows::Win32::Foundation::CloseHandle;
-use windows::{
-    core::{w, PCWSTR},
-    Win32::{Foundation::GENERIC_READ, Storage::FileSystem::*},
-};
-
-use crate::win_dedupe::{DiskReader, FileMetadata, ReadSeekNtfsAttributeValue};
+use std::error;
+use std::str::from_utf8;
+use mft::attribute::{MftAttributeContent, MftAttributeType};
+use mft::attribute::header::ResidentialHeader::{NonResident, Resident};
+use mft::MftParser;
+use ntfs::KnownNtfsFileRecordNumber::MFT;
+use ntfs::Ntfs;
+use windows::core::{PCWSTR, w};
+use windows::Win32::Foundation::{CloseHandle, GENERIC_READ};
+use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile};
+use win_dedupe::{DiskReader, FileMetadata, ReadSeekNtfsAttributeValue};
 
 fn main() -> Result<(), Box<dyn error::Error>> {
-    println!("{:#?}", get_logical_volumes());
-
-    let mut siv = Cursive::new();
-
-    // Start with a nicer theme than default
-    siv.set_theme(cursive::theme::Theme {
-        shadow: false,
-        borders: BorderStyle::Simple,
-        palette: Palette::retro().with(|palette| {
-            use cursive::theme::BaseColor::*;
-            {
-                // First, override some colors from the base palette.
-                use cursive::theme::Color::TerminalDefault;
-                use cursive::theme::PaletteColor::*;
-
-                palette[Background] = TerminalDefault;
-                palette[View] = TerminalDefault;
-                palette[Primary] = White.dark();
-                palette[TitlePrimary] = Blue.light();
-                palette[Secondary] = Blue.light();
-                palette[Highlight] = Blue.dark();
-            }
-
-            {
-                // Then override some styles.
-                use cursive::theme::Effect::*;
-                use cursive::theme::PaletteStyle::*;
-                use cursive::theme::Style;
-                palette[Highlight] = Style::from(Blue.light()).combine(Bold).combine(Reverse);
-                palette[EditableTextCursor] = Style::secondary().combine(Reverse).combine(Underline)
-            }
-        }),
-    });
-
-    let buttons = LinearLayout::vertical()
-        .child(TextView::new(
-"WinDedupe is an application for finding and removing duplicate files on Windows machines.
-
-WinDedupe accelerates search by reading the Master File Table of NTFS-formatted volumes.
-Finding duplicate files on other filesystems is slower.
-
-Select an option:"
-    ))
-        .child(Button::new("Find duplicate files", deduplicate_files_menu))
-        .child(Button::new("Explore volumes", explore_volumes_menu))
-        .child(DummyView)
-        .child(Button::new("Quit", Cursive::quit));
-
-    siv.add_layer(Dialog::around(buttons).title("Welcome to WinDedupe!"));
-
-    siv.add_global_callback(Event::CtrlChar('c'), Cursive::quit);
-
-    siv.run();
-
-    Ok(())
-}
-
-fn deduplicate_files_menu(s: &mut Cursive) {}
-
-fn explore_a_volume_menu(s: &mut Cursive, volume: &str) {}
-
-fn explore_volumes_menu(s: &mut Cursive) {
-    let mut select = SelectView::<String>::new().on_submit(explore_a_volume_menu);
-
-    select.add_all_str(get_logical_volumes());
-    println!("{:#?}", get_logical_volumes());
-
-    s.pop_layer();
-    s.add_layer(Dialog::around(select).title("Select a Volume"));
-}
-
-fn get_logical_volumes() -> Vec<String> {
-    let mut buf;
-    unsafe {
-        buf = vec![0u16; GetLogicalDriveStringsW(None) as usize];
-        GetLogicalDriveStringsW(Some(&mut buf));
-    }
-
-    // split buffer by nulls
-    buf.split(|b| *b == 0u16)
-        .filter(|f| f.len() > 0)
-        .map(|f| String::from_utf16(f).unwrap())
-        .collect()
-}
-
-fn mft_list_dir_test() -> Result<(), Box<dyn error::Error>> {
     let path: PCWSTR = w!(r"\\.\C:");
     let mut file_metadata: Vec<Option<FileMetadata>>;
 
@@ -205,7 +100,7 @@ fn mft_list_dir_test() -> Result<(), Box<dyn error::Error>> {
                 }
             }
 
-            file_metadata[index as usize] = Some(FileMetadata {
+            file_metadata[index] = Some(FileMetadata {
                 name,
                 index: index as u64,
                 parent_indices,
