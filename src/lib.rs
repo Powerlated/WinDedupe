@@ -6,22 +6,25 @@ use std::{
     mem::size_of,
     *,
 };
+use std::collections::hash_set::Iter;
 use std::error::Error;
 use std::io::SeekFrom::Start;
+use std::iter::{Filter, FilterMap};
+use anyhow::Result;
 use std::str::from_utf8;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use mft::attribute::{MftAttributeContent, MftAttributeType};
 use mft::attribute::header::ResidentialHeader::{NonResident, Resident};
 use mft::MftParser;
+use ntfs::attribute_value::NtfsNonResidentAttributeValue;
 use ntfs::KnownNtfsFileRecordNumber::MFT;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE};
 use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_BEGIN, FILE_END, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, GetFileType, OPEN_EXISTING, ReadFile, SetFilePointerEx};
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{DISK_GEOMETRY, IOCTL_DISK_GET_DRIVE_GEOMETRY};
-use winsafe::{File, FileAccess};
-use winsafe::FileAccess::{CreateRW, ExistingReadOnly};
+
 
 // An struct storing the bare minimum needed for this program to work
 #[derive(Clone)]
@@ -46,7 +49,7 @@ pub struct VolumeReader {
 }
 
 impl VolumeReader {
-    pub fn from_raw_handle(handle: HANDLE) -> Result<Self, io::Error> {
+    pub fn from_raw_handle(handle: HANDLE) -> Result<Self> {
         let mut geometry: DISK_GEOMETRY = Default::default();
         unsafe {
             assert_eq!(GetFileType(handle), FILE_TYPE_DISK);
@@ -72,7 +75,7 @@ impl VolumeReader {
         })
     }
 
-    pub fn open_path(path: &str) -> Result<VolumeReader, Box<dyn Error>> {
+    pub fn open_path(path: &str) -> Result<VolumeReader> {
         let mut path: Vec<u16> = path.encode_utf16().collect();
         path.push(0);
 
@@ -80,7 +83,7 @@ impl VolumeReader {
             let disk_handle = CreateFileW(
                 PCWSTR::from_raw(path.as_ptr()),
                 GENERIC_READ.0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
                 OPEN_EXISTING,
                 FILE_FLAGS_AND_ATTRIBUTES(0),
@@ -169,26 +172,6 @@ impl Drop for VolumeReader {
     }
 }
 
-pub struct ReadSeekNtfsAttributeValue<'a, T>(pub &'a mut T, pub NtfsAttributeValue<'a, 'a>);
-
-impl<T> Read for ReadSeekNtfsAttributeValue<'_, T>
-    where
-        T: Read + Seek,
-{
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        Ok(self.1.read(&mut self.0, buf)?)
-    }
-}
-
-impl<T> Seek for ReadSeekNtfsAttributeValue<'_, T>
-    where
-        T: Read + Seek,
-{
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        Ok(self.1.seek(&mut self.0, pos)?)
-    }
-}
-
 fn verify_ntfs_system_id(reader: &mut VolumeReader) -> bool {
     // Read 8 byte system ID, should be "NTFS    "
     let mut buf = [0u8; 8];
@@ -200,7 +183,7 @@ fn verify_ntfs_system_id(reader: &mut VolumeReader) -> bool {
 pub struct VolumeIndexFlatArray(pub Vec<Option<FileMetadata>>);
 
 impl VolumeIndexFlatArray {
-    pub fn from(reader: &mut VolumeReader, progress_counter: Option<Arc<AtomicUsize>>) -> Result<Self, Box<dyn Error>> {
+    pub fn from(reader: &mut VolumeReader, progress_counter: Option<Arc<AtomicUsize>>) -> Result<Self> {
         let mut file_metadata: Vec<Option<FileMetadata>>;
 
         unsafe {
@@ -210,67 +193,68 @@ impl VolumeIndexFlatArray {
             let file = fs.file(reader, MFT as u64)?;
             let data = file.data(reader, "").unwrap()?;
             let data_attr = data.to_attribute()?;
-            let mft_data_value = data_attr.value(reader)?;
-            let mut read_seek = ReadSeekNtfsAttributeValue(reader, mft_data_value);
-            let mut mft = MftParser::from_read_seek(&mut read_seek, None)?;
+            let mft_reader = data_attr.value(reader)?.attach(reader);
+            let mut mft = MftParser::from_read_seek(mft_reader, None)?;
+
             let entry_count = mft.get_entry_count();
             file_metadata = vec![None::<FileMetadata>; entry_count as usize];
 
             for (index, er) in mft.iter_entries().enumerate() {
-                let e = er?;
+                if let Ok(e) = er {
 
-                // Files with inode > 24 are ordinary files/directories
-                let mut name = None::<String>;
-                let mut parent_indices = HashSet::new();
-                let mut is_dir = false;
-                let mut file_size = 0u64;
-                let mut allocated_size = 0u64;
-                let children_indices = HashSet::new();
+                    // Files with inode > 24 are ordinary files/directories
+                    let mut name = None::<String>;
+                    let mut parent_indices = HashSet::new();
+                    let mut is_dir = false;
+                    let mut file_size = 0u64;
+                    let mut allocated_size = 0u64;
+                    let children_indices = HashSet::new();
 
-                for a in e.iter_attributes().filter_map(|attr| attr.ok()) {
-                    // Filename (AttrX30) is always resident so we are fine here
-                    // If a file has hard links it has multiple filename attributes
-                    match a.data {
-                        MftAttributeContent::AttrX30(a) => {
-                            parent_indices.insert(a.parent.entry);
-                            name = Some(a.name);
-                            is_dir = e.is_dir();
+                    for a in e.iter_attributes().filter_map(|attr| attr.ok()) {
+                        // Filename (AttrX30) is always resident so we are fine here
+                        // If a file has hard links it has multiple filename attributes
+                        match a.data {
+                            MftAttributeContent::AttrX30(a) => {
+                                parent_indices.insert(a.parent.entry);
+                                name = Some(a.name);
+                                is_dir = e.is_dir();
+                            }
+                            _ => {}
                         }
-                        _ => {}
-                    }
 
-                    // Data (AttrX80) can be non-resident if it is too big for the MFT entry
-                    match a.header.type_code {
-                        MftAttributeType::DATA => {
-                            match a.header.residential_header {
-                                Resident(h) => {
-                                    file_size = h.data_size as u64;
-                                    allocated_size = h.data_size as u64;
-                                }
-                                NonResident(h) => {
-                                    // mft crate docs say that valid_data_length and allocated_length are invalid if vcn_first != 0
-                                    // assert_eq!(h.vnc_first, 0);
-                                    file_size = h.file_size;
-                                    // When a file is compressed, allocated_length is an even multiple of the compression unit size rather than the cluster size.
-                                    allocated_size = h.allocated_length;
-                                    // Compression unit size = 2^x clusters
-                                    // println!("Compression unit size (bytes): {}", 2u32.pow(h.unit_compression_size as u32) * fs.cluster_size());
+                        // Data (AttrX80) can be non-resident if it is too big for the MFT entry
+                        match a.header.type_code {
+                            MftAttributeType::DATA => {
+                                match a.header.residential_header {
+                                    Resident(h) => {
+                                        file_size = h.data_size as u64;
+                                        allocated_size = h.data_size as u64;
+                                    }
+                                    NonResident(h) => {
+                                        // mft crate docs say that valid_data_length and allocated_length are invalid if vcn_first != 0
+                                        // assert_eq!(h.vnc_first, 0);
+                                        file_size = h.file_size;
+                                        // When a file is compressed, allocated_length is an even multiple of the compression unit size rather than the cluster size.
+                                        allocated_size = h.allocated_length;
+                                        // Compression unit size = 2^x clusters
+                                        // println!("Compression unit size (bytes): {}", 2u32.pow(h.unit_compression_size as u32) * fs.cluster_size());
+                                    }
                                 }
                             }
+                            _ => {}
                         }
-                        _ => {}
                     }
-                }
 
-                file_metadata[index] = Some(FileMetadata {
-                    name,
-                    index: index as u64,
-                    parent_indices,
-                    is_dir,
-                    file_size,
-                    allocated_size,
-                    children_indices,
-                });
+                    file_metadata[index] = Some(FileMetadata {
+                        name,
+                        index: index as u64,
+                        parent_indices,
+                        is_dir,
+                        file_size,
+                        allocated_size,
+                        children_indices,
+                    });
+                }
 
                 // Send progress update for every percentage
                 if index % (entry_count / 100) as usize == 0 {
@@ -292,7 +276,7 @@ impl VolumeIndexFlatArray {
                 for parent_index in fm.clone().unwrap().parent_indices.iter() {
                     self.0[*parent_index as usize]
                         .as_mut()
-                        .unwrap()
+                        .expect("Parent directory should exist")
                         .children_indices
                         .insert(i as u64);
                 }
@@ -305,14 +289,25 @@ impl VolumeIndexFlatArray {
 
 pub struct VolumeIndexTree(pub Vec<Option<FileMetadata>>);
 
-pub fn get_mft_entry_count(reader: &mut VolumeReader) -> Result<u64, Box<dyn Error>> {
+impl VolumeIndexTree {
+    pub fn dir_children(&self, inode: usize) -> Option<FilterMap<Iter<u64>, fn(&u64) -> Option<&u64>>> {
+        if let Some(file) = &self.0[inode] {
+            println!("inode {inode} exists");
+            // Files with inode > 24 are ordinary files/directories
+            return Some(file.children_indices.iter().filter_map(|i| if *i > 24 { Some(i) } else { None }));
+        }
+
+        None
+    }
+}
+
+pub fn get_mft_entry_count(reader: &mut VolumeReader) -> Result<u64> {
     let fs = Ntfs::new(reader)?;
     let file = fs.file(reader, MFT as u64)?;
     let data = file.data(reader, "").unwrap()?;
     let data_attr = data.to_attribute()?;
-    let mft_data_value = data_attr.value(reader)?;
-    let mut read_seek = ReadSeekNtfsAttributeValue(reader, mft_data_value);
-    let mut mft = MftParser::from_read_seek(&mut read_seek, None)?;
+    let mft_data_value = data_attr.value(reader)?.attach(reader);
+    let mft = MftParser::from_read_seek(mft_data_value, None)?;
 
     Ok(mft.get_entry_count())
 }

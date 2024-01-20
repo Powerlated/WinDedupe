@@ -1,6 +1,6 @@
 use std::error;
-use ntfs::KnownNtfsFileRecordNumber::{MFT, RootDirectory, Volume};
-use win_dedupe::{VolumeReader, FileMetadata, ReadSeekNtfsAttributeValue, VolumeIndexFlatArray};
+use ntfs::KnownNtfsFileRecordNumber::{RootDirectory};
+use win_dedupe::{VolumeReader, VolumeIndexFlatArray};
 
 fn main() -> Result<(), Box<dyn error::Error>> {
     let path = r"\\.\C:";
@@ -11,24 +11,14 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     println!("Building tree...");
     let index = index.build_tree();
 
-    let list_dir = |inode: usize| {
-        if let Some(file) = &index.0[inode] {
-            for i in &file.children_indices {
-                // Files with inode > 24 are ordinary files/directories
-                let child = index.0[*i as usize].as_ref().unwrap();
-                if *i > 24 {
-                    println!(
-                        "i:{} {}{}",
-                        child.index,
-                        child.name.as_ref().unwrap(),
-                        if child.is_dir { "/" } else { "" }
-                    );
-                }
+    if let Some(children) = index.dir_children(RootDirectory as usize) {
+        println!("Root directory has children");
+        for c in children {
+            if let Some(f) = &index.0[*c as usize] {
+                println!("{}", f.name.as_ref().unwrap());
             }
         }
-    };
-
-    list_dir(RootDirectory as usize);
+    }
 
     Ok(())
 }

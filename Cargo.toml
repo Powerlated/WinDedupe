@@ -2,6 +2,7 @@
 name = "win_dedupe"
 version = "0.1.0"
 edition = "2021"
+default-run = "win_dedupe"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -23,12 +24,14 @@ windows = { version = "0.52.0", features = [
     "Win32_System_Ioctl",
 ] }
 num-format = "0.4.4"
+anyhow = { version = "1.0.79", features = ["backtrace"] }
 
 [build-dependencies]
 winres = "0.1.12"
 
 [profile.dev]
-opt-level = 1
+opt-level = 0
+overflow-checks = false
 
 [profile.release]
 opt-level = 3
