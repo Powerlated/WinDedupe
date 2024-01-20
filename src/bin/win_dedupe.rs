@@ -10,6 +10,7 @@ use cursive::{Cursive, CursiveExt};
 
 
 use std::*;
+use std::cmp::Ordering;
 use std::path::Component::RootDir;
 use std::thread::JoinHandle;
 use crossterm::style::Stylize;
@@ -25,6 +26,7 @@ use winsafe::{GetLogicalDriveStrings, GetVolumeInformation};
 struct UserData {
     index: Option<VolumeIndexTree>,
     dir_stack: Vec<usize>,
+    drive_letter: char,
 }
 
 fn main() -> Result<()> {
@@ -130,6 +132,8 @@ fn explore_a_volume_loading(s: &mut Cursive, path: &str) {
             .title("Please Wait"),
     );
 
+    get_user_data(s).drive_letter = drive_letter;
+
     thread::spawn(move || {
         let index = VolumeIndexFlatArray::from(&mut reader, Some(counter.0)).unwrap();
         cb.send(Box::new(|s| build_tree_loading_screen(s, index))).unwrap();
@@ -143,61 +147,74 @@ fn build_tree_loading_screen(s: &mut Cursive, index: VolumeIndexFlatArray) {
             .title("Please Wait"),
     );
 
-    s.user_data::<UserData>().unwrap().index = Some(index.build_tree());
+    get_user_data(s).index = Some(index.build_tree());
     s.cb_sink().send(Box::new(finished_loading)).unwrap();
+}
+
+fn get_user_data(s: &mut Cursive) -> &mut UserData {
+    s.user_data::<UserData>().unwrap()
 }
 
 fn finished_loading(s: &mut Cursive) {
     s.set_autorefresh(false);
-    explore_a_volume_screen(s, RootDirectory as usize);
+    get_user_data(s).dir_stack.push(RootDirectory as usize);
+    explore_a_volume_screen(s);
 }
 
-#[derive(Clone, Copy)]
-struct VolumeExploreParams {
-    inode: usize,
-    parent_inode: Option<usize>,
-}
-
-fn explore_a_volume_screen(s: &mut Cursive, parent_inode: usize) {
-    let mut select = SelectView::<(usize, Option<usize>)>::new()
-        .on_submit(|s, (inode, parent_inode)| {
-            let mut user_data = s.user_data::<UserData>();
-            let user_data = user_data.as_mut().unwrap();
+fn explore_a_volume_screen(s: &mut Cursive) {
+    let mut select = SelectView::<(usize, bool)>::new()
+        .on_submit(|s, (inode, push_to_stack) | {
+            let user_data = get_user_data(s);
             let index = user_data.index.as_ref().unwrap();
 
             if index.0[*inode].as_ref().unwrap().is_dir {
-                if let Some(parent_inode) = parent_inode {
-                    user_data.dir_stack.push(*parent_inode);
+                if *push_to_stack {
+                    user_data.dir_stack.push(*inode);
+                } else {
+                    user_data.dir_stack.pop();
                 }
-                explore_a_volume_screen(s, *inode);
+                explore_a_volume_screen(s);
             }
         });
-    let user_data = s.user_data::<UserData>();
-    let user_data = user_data.as_ref().unwrap();
-    let index = user_data.index.as_ref().unwrap();
 
-    // let select = OnEventView::new(select)
-    //     .on_pre_event_inner(Event::Key(Key::Left), |select, _| {
-    //         s.
-    //     });
+    let u = get_user_data(s);
+    let parent_inode = u.dir_stack.last().unwrap();
+    let index = u.index.as_ref().unwrap();
 
-    if let Some(last) = user_data.dir_stack.last() {
-        select.add_item("../", (*last, None));
-    }
-
-    for i in index.dir_children(parent_inode).unwrap() {
+    for i in index.dir_children(*parent_inode).unwrap() {
         let i = *i as usize;
         let f = index.0[i].as_ref().unwrap();
         if f.is_dir {
-            select.add_item(format!("{}/", f.name.as_ref().unwrap()), (i, Some(parent_inode)));
+            select.add_item(format!("{}/", f.name.as_ref().unwrap()), (i, true));
         } else {
-            select.add_item(f.name.as_ref().unwrap(), (i, Some(parent_inode)));
+            select.add_item(f.name.as_ref().unwrap(), (i, true));
+        }
+    }
+
+    select.sort_by(|(inode0, _), (inode1, _)| {
+        let file0 = u.index.as_ref().unwrap().0[*inode0].as_ref().unwrap();
+        let file1 = u.index.as_ref().unwrap().0[*inode1].as_ref().unwrap();
+
+        if file0.is_dir && !file1.is_dir { return Ordering::Less }
+        if !file0.is_dir && file1.is_dir { return Ordering::Greater }
+
+        file0.name.as_ref().unwrap().to_lowercase().cmp(&file1.name.as_ref().unwrap().to_lowercase())
+    });
+
+    if let Some(i) = u.dir_stack.iter().rev().nth(1) {
+        select.insert_item(0, "../", (*i, false));
+    }
+
+    let mut title = format!("Explore: {}:/", u.drive_letter.to_uppercase());
+    if let Some((_, tail)) = u.dir_stack.split_first() {
+        for inode in tail {
+            title.push_str(&*format!("{}/", index.0[*inode].as_ref().unwrap().name.as_ref().unwrap()));
         }
     }
 
     s.pop_layer();
     s.add_layer(
         Dialog::around(ScrollView::new(select))
-            .title("Explore")
+            .title(title)
     )
 }
