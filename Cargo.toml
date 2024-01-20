@@ -8,7 +8,7 @@ default-run = "win_dedupe"
 
 [dependencies]
 crossterm = "0.27.0"
-cursive = { git = "https://github.com/gyscos/cursive", default-features = false, features = [
+cursive = { version = "0.20.0", default-features = false, features = [
     "crossterm-backend",
 ] }
 mft = { git = "https://github.com/omerbenamram/mft", rev = "6767bb5" }

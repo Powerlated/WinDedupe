@@ -10,13 +10,17 @@ use cursive::{Cursive, CursiveExt};
 
 use clap::Parser;
 
+use cursive::view::Resizable;
+
 use std::*;
 use std::cmp::Ordering;
 use cursive::utils::Counter;
 use ntfs::KnownNtfsFileRecordNumber::RootDirectory;
 use num_format::{Locale, ToFormattedString};
-use win_dedupe::{get_mft_entry_count, VolumeIndexFlatArray, VolumeIndexTree, VolumeReader};
+use win_dedupe::{FileMetadata, get_mft_entry_count, VolumeIndexFlatArray, VolumeIndexTree, VolumeReader};
 use anyhow::Result;
+use cursive::view::Nameable;
+use cursive_table_view::{TableView, TableViewItem};
 
 use winsafe::{GetLogicalDriveStrings, GetVolumeInformation};
 
@@ -63,7 +67,7 @@ fn main() -> Result<()> {
                 use cursive::theme::PaletteStyle::*;
                 use cursive::theme::Style;
                 palette[Highlight] = Style::from(Blue.light()).combine(Bold).combine(Reverse);
-                palette[EditableTextCursor] = Style::secondary().combine(Reverse).combine(Underline)
+                // palette[EditableTextCursor] = Style::secondary().combine(Reverse).combine(Underline)
             }
         }),
     });
@@ -170,20 +174,51 @@ fn finished_loading(s: &mut Cursive) {
     explore_a_volume_screen(s);
 }
 
-fn explore_a_volume_screen(s: &mut Cursive) {
-    let mut select = SelectView::<(usize, bool)>::new()
-        .on_submit(|s, (inode, push_to_stack) | {
-            let user_data = get_user_data(s);
-            let index = user_data.index.as_ref().unwrap();
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+enum ExploreVolumeColumn {
+    Name,
+    Size,
+}
 
-            if index.0[*inode].as_ref().unwrap().is_dir {
-                if *push_to_stack {
-                    user_data.dir_stack.push(*inode);
+impl TableViewItem<ExploreVolumeColumn> for (FileMetadata, bool) {
+    fn to_column(&self, column: ExploreVolumeColumn) -> String {
+        match column {
+            ExploreVolumeColumn::Name => {
+                if self.1 {
+                    String::from("↩️ ../")
                 } else {
-                    user_data.dir_stack.pop();
+                    let name = self.0.name.clone().unwrap();
+                    if self.0.is_dir {
+                        format!("📁 {name}/")
+                    } else {
+                        format!("📄 {name}")
+                    }
                 }
-                explore_a_volume_screen(s);
             }
+            ExploreVolumeColumn::Size => self.0.file_size.to_string(),
+        }
+    }
+
+    fn cmp(&self, other: &Self, _column: ExploreVolumeColumn) -> Ordering
+        where
+            Self: Sized,
+    {
+        if self.1 { return Ordering::Less; }
+        if other.1 { return Ordering::Greater; }
+
+        if self.0.is_dir && !other.0.is_dir { return Ordering::Less; }
+        if !self.0.is_dir && other.0.is_dir { return Ordering::Greater; }
+
+        self.0.name.as_ref().unwrap().to_lowercase().cmp(&other.0.name.as_ref().unwrap().to_lowercase())
+    }
+}
+
+fn explore_a_volume_screen(s: &mut Cursive) {
+    let mut table = TableView::<(FileMetadata, bool), ExploreVolumeColumn>::new()
+        .column(ExploreVolumeColumn::Name, "Name", |c| c.width_percent(80))
+        .column(ExploreVolumeColumn::Size, "Size", |c| {
+            c.ordering(Ordering::Greater)
+                .width_percent(20)
         });
 
     let u = get_user_data(s);
@@ -192,27 +227,29 @@ fn explore_a_volume_screen(s: &mut Cursive) {
 
     for i in index.dir_children(*parent_inode).unwrap() {
         let i = *i as usize;
-        let f = index.0[i].as_ref().unwrap();
-        if f.is_dir {
-            select.add_item(format!("{}/", f.name.as_ref().unwrap()), (i, true));
-        } else {
-            select.add_item(f.name.as_ref().unwrap(), (i, true));
-        }
+        table.insert_item((index.0[i].clone().unwrap(), false));
     }
-
-    select.sort_by(|(inode0, _), (inode1, _)| {
-        let file0 = u.index.as_ref().unwrap().0[*inode0].as_ref().unwrap();
-        let file1 = u.index.as_ref().unwrap().0[*inode1].as_ref().unwrap();
-
-        if file0.is_dir && !file1.is_dir { return Ordering::Less }
-        if !file0.is_dir && file1.is_dir { return Ordering::Greater }
-
-        file0.name.as_ref().unwrap().to_lowercase().cmp(&file1.name.as_ref().unwrap().to_lowercase())
-    });
 
     if let Some(i) = u.dir_stack.iter().rev().nth(1) {
-        select.insert_item(0, "../", (*i, false));
+        table.insert_item_at(0, (index.0[*i].clone().unwrap(), true));
     }
+
+    table.set_on_submit(|s, _row, index| {
+        let f = s
+            .call_on_name("table", move |table: &mut TableView<(FileMetadata, bool), ExploreVolumeColumn>| {
+                table.borrow_item(index).clone().unwrap().clone()
+            })
+            .unwrap();
+
+        let u = get_user_data(s);
+        if f.1 {
+            u.dir_stack.pop();
+        } else if f.0.is_dir {
+            u.dir_stack.push(f.0.index as usize);
+        }
+
+        explore_a_volume_screen(s);
+    });
 
     let mut title = format!("Explore: {}:/", u.drive_letter.to_uppercase());
     if let Some((_, tail)) = u.dir_stack.split_first() {
@@ -223,7 +260,7 @@ fn explore_a_volume_screen(s: &mut Cursive) {
 
     s.pop_layer();
     s.add_layer(
-        Dialog::around(ScrollView::new(select))
+        Dialog::around(table.with_name("table").full_screen())
             .title(title)
     )
 }

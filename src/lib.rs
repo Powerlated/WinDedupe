@@ -1,4 +1,4 @@
-use ntfs::{attribute_value::NtfsAttributeValue, Ntfs, NtfsReadSeek};
+use ntfs::Ntfs;
 use std::collections::HashSet;
 use std::{
     ffi::c_void,
@@ -7,21 +7,20 @@ use std::{
     *,
 };
 use std::collections::hash_set::Iter;
-use std::error::Error;
 use std::io::SeekFrom::Start;
-use std::iter::{Filter, FilterMap};
+use std::iter::FilterMap;
 use anyhow::Result;
 use std::str::from_utf8;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use mft::attribute::{MftAttributeContent, MftAttributeType};
 use mft::attribute::header::ResidentialHeader::{NonResident, Resident};
+use mft::attribute::x30::FileNamespace::DOS;
 use mft::MftParser;
-use ntfs::attribute_value::NtfsNonResidentAttributeValue;
 use ntfs::KnownNtfsFileRecordNumber::MFT;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE};
-use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_BEGIN, FILE_END, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, GetFileType, OPEN_EXISTING, ReadFile, SetFilePointerEx};
+use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_BEGIN, FILE_END, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, GetFileType, OPEN_EXISTING, ReadFile, SetFilePointerEx};
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{DISK_GEOMETRY, IOCTL_DISK_GET_DRIVE_GEOMETRY};
 
@@ -186,81 +185,81 @@ impl VolumeIndexFlatArray {
     pub fn from(reader: &mut VolumeReader, progress_counter: Option<Arc<AtomicUsize>>) -> Result<Self> {
         let mut file_metadata: Vec<Option<FileMetadata>>;
 
-        unsafe {
-            assert!(verify_ntfs_system_id(reader));
+        assert!(verify_ntfs_system_id(reader));
 
-            let fs = Ntfs::new(reader)?;
-            let file = fs.file(reader, MFT as u64)?;
-            let data = file.data(reader, "").unwrap()?;
-            let data_attr = data.to_attribute()?;
-            let mft_reader = data_attr.value(reader)?.attach(reader);
-            let mut mft = MftParser::from_read_seek(mft_reader, None)?;
+        let fs = Ntfs::new(reader)?;
+        let file = fs.file(reader, MFT as u64)?;
+        let data = file.data(reader, "").unwrap()?;
+        let data_attr = data.to_attribute()?;
+        let mft_reader = data_attr.value(reader)?.attach(reader);
+        let mut mft = MftParser::from_read_seek(mft_reader, None)?;
 
-            let entry_count = mft.get_entry_count();
-            file_metadata = vec![None::<FileMetadata>; entry_count as usize];
+        let entry_count = mft.get_entry_count();
+        file_metadata = vec![None::<FileMetadata>; entry_count as usize];
 
-            for (index, er) in mft.iter_entries().enumerate() {
-                if let Ok(e) = er {
+        for (index, er) in mft.iter_entries().enumerate() {
+            if let Ok(e) = er {
 
-                    // Files with inode > 24 are ordinary files/directories
-                    let mut name = None::<String>;
-                    let mut parent_indices = HashSet::new();
-                    let mut is_dir = false;
-                    let mut file_size = 0u64;
-                    let mut allocated_size = 0u64;
-                    let children_indices = HashSet::new();
+                // Files with inode > 24 are ordinary files/directories
+                let mut name = None::<String>;
+                let mut parent_indices = HashSet::new();
+                let mut is_dir = false;
+                let mut file_size = 0u64;
+                let mut allocated_size = 0u64;
+                let children_indices = HashSet::new();
 
-                    for a in e.iter_attributes().filter_map(|attr| attr.ok()) {
-                        // Filename (AttrX30) is always resident so we are fine here
-                        // If a file has hard links it has multiple filename attributes
-                        match a.data {
-                            MftAttributeContent::AttrX30(a) => {
+                for a in e.iter_attributes().filter_map(|attr| attr.ok()) {
+                    // Filename (AttrX30) is always resident so we are fine here
+                    // If a file has hard links it has multiple filename attributes
+                    match a.data {
+                        MftAttributeContent::AttrX30(a) => {
+                            if a.namespace != DOS {
                                 parent_indices.insert(a.parent.entry);
                                 name = Some(a.name);
                                 is_dir = e.is_dir();
                             }
-                            _ => {}
                         }
+                        _ => {}
+                    }
 
-                        // Data (AttrX80) can be non-resident if it is too big for the MFT entry
-                        match a.header.type_code {
-                            MftAttributeType::DATA => {
-                                match a.header.residential_header {
-                                    Resident(h) => {
-                                        file_size = h.data_size as u64;
-                                        allocated_size = h.data_size as u64;
-                                    }
-                                    NonResident(h) => {
-                                        // mft crate docs say that valid_data_length and allocated_length are invalid if vcn_first != 0
-                                        // assert_eq!(h.vnc_first, 0);
-                                        file_size = h.file_size;
-                                        // When a file is compressed, allocated_length is an even multiple of the compression unit size rather than the cluster size.
-                                        allocated_size = h.allocated_length;
-                                        // Compression unit size = 2^x clusters
-                                        // println!("Compression unit size (bytes): {}", 2u32.pow(h.unit_compression_size as u32) * fs.cluster_size());
-                                    }
+                    // Data (AttrX80) can be non-resident if it is too big for the MFT entry
+                    match a.header.type_code {
+                        MftAttributeType::DATA => {
+                            match a.header.residential_header {
+                                Resident(h) => {
+                                    file_size = h.data_size as u64;
+                                    allocated_size = h.data_size as u64;
+                                }
+                                NonResident(h) => {
+                                    // mft crate docs say that valid_data_length and allocated_length are invalid if vcn_first != 0
+                                    // assert_eq!(h.vnc_first, 0);
+                                    file_size = h.file_size;
+                                    // When a file is compressed, allocated_length is an even multiple of the compression unit size rather than the cluster size.
+                                    allocated_size = h.allocated_length;
+                                    // Compression unit size = 2^x clusters
+                                    // println!("Compression unit size (bytes): {}", 2u32.pow(h.unit_compression_size as u32) * fs.cluster_size());
                                 }
                             }
-                            _ => {}
                         }
+                        _ => {}
                     }
-
-                    file_metadata[index] = Some(FileMetadata {
-                        name,
-                        index: index as u64,
-                        parent_indices,
-                        is_dir,
-                        file_size,
-                        allocated_size,
-                        children_indices,
-                    });
                 }
 
-                // Send progress update for every percentage
-                if index % (entry_count / 100) as usize == 0 {
-                    if let Some(ref progress_counter) = progress_counter {
-                        progress_counter.store(index, Ordering::Relaxed);
-                    }
+                file_metadata[index] = Some(FileMetadata {
+                    name,
+                    index: index as u64,
+                    parent_indices,
+                    is_dir,
+                    file_size,
+                    allocated_size,
+                    children_indices,
+                });
+            }
+
+            // Send progress update for every percentage
+            if index % (entry_count / 100) as usize == 0 {
+                if let Some(ref progress_counter) = progress_counter {
+                    progress_counter.store(index, Ordering::Relaxed);
                 }
             }
         }
