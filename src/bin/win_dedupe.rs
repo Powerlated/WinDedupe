@@ -2,18 +2,16 @@
 #![feature(iter_collect_into)]
 #![feature(try_blocks)]
 
-use cursive::event::{Event, EventResult, Key};
+use cursive::event::Event;
 use cursive::theme::{BorderStyle, Palette};
 use cursive::traits::With;
-use cursive::views::{Button, Dialog, DummyView, LinearLayout, OnEventView, ProgressBar, ScrollView, SelectView, TextView};
+use cursive::views::{Button, Dialog, DummyView, LinearLayout, ProgressBar, ScrollView, SelectView, TextView};
 use cursive::{Cursive, CursiveExt};
 
+use clap::Parser;
 
 use std::*;
 use std::cmp::Ordering;
-use std::path::Component::RootDir;
-use std::thread::JoinHandle;
-use crossterm::style::Stylize;
 use cursive::utils::Counter;
 use ntfs::KnownNtfsFileRecordNumber::RootDirectory;
 use num_format::{Locale, ToFormattedString};
@@ -21,6 +19,12 @@ use win_dedupe::{get_mft_entry_count, VolumeIndexFlatArray, VolumeIndexTree, Vol
 use anyhow::Result;
 
 use winsafe::{GetLogicalDriveStrings, GetVolumeInformation};
+
+/// Search for a pattern in a file and display the lines that contain it.
+#[derive(Parser)]
+struct Cli {
+    path: Option<String>,
+}
 
 #[derive(Default)]
 struct UserData {
@@ -64,21 +68,26 @@ fn main() -> Result<()> {
         }),
     });
 
-    let buttons = LinearLayout::vertical()
-        .child(TextView::new(
-            "WinDedupe is an application for finding and removing duplicate files on Windows machines.
+    let args = Cli::parse();
+    if let Some(path) = args.path {
+        explore_a_volume_loading(&mut siv, &path);
+    } else {
+        let buttons = LinearLayout::vertical()
+            .child(TextView::new(
+                "WinDedupe is an application for finding and removing duplicate files on Windows machines.
 
 WinDedupe accelerates search by reading the Master File Table of NTFS-formatted volumes.
 Finding duplicate files on other filesystems is slower.
 
 Select an option:"
-        ))
-        .child(Button::new("Find duplicate files", deduplicate_files_menu))
-        .child(Button::new("Explore volumes", explore_volumes_menu))
-        .child(DummyView)
-        .child(Button::new("Quit", Cursive::quit));
+            ))
+            .child(Button::new("Find duplicate files", deduplicate_files_menu))
+            .child(Button::new("Explore volumes", explore_volumes_menu))
+            .child(DummyView)
+            .child(Button::new("Quit", Cursive::quit));
 
-    siv.add_layer(Dialog::around(ScrollView::new(buttons)).title("Welcome to WinDedupe!"));
+        siv.add_layer(Dialog::around(ScrollView::new(buttons)).title("Welcome to WinDedupe!"));
+    }
 
     siv.add_global_callback(Event::CtrlChar('c'), Cursive::quit);
 
