@@ -14,6 +14,9 @@ use cursive::view::Resizable;
 
 use std::*;
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::path::Path;
 use cursive::utils::Counter;
 use ntfs::KnownNtfsFileRecordNumber::RootDirectory;
 use num_format::{Locale, ToFormattedString};
@@ -21,6 +24,7 @@ use win_dedupe::{FileMetadata, get_mft_entry_count, VolumeIndexFlatArray, Volume
 use anyhow::Result;
 use cursive::view::Nameable;
 use cursive_table_view::{TableView, TableViewItem};
+use phf::phf_map;
 
 use winsafe::{GetLogicalDriveStrings, GetVolumeInformation};
 
@@ -182,13 +186,14 @@ enum ExploreVolumeColumn {
 
 impl TableViewItem<ExploreVolumeColumn> for (FileMetadata, bool) {
     fn to_column(&self, column: ExploreVolumeColumn) -> String {
+        let (f, pop_from_stack) = self;
         match column {
             ExploreVolumeColumn::Name => {
-                if self.1 {
+                if *pop_from_stack {
                     String::from("↩️ ../")
                 } else {
-                    let name = self.0.name.clone().unwrap();
-                    if self.0.is_dir {
+                    let name = f.name.clone().unwrap();
+                    if f.is_dir {
                         format!("📁 {name}/")
                     } else {
                         format!("📄 {name}")
@@ -199,23 +204,32 @@ impl TableViewItem<ExploreVolumeColumn> for (FileMetadata, bool) {
         }
     }
 
-    fn cmp(&self, other: &Self, _column: ExploreVolumeColumn) -> Ordering
+    fn cmp(&self, other: &Self, column: ExploreVolumeColumn) -> Ordering
         where
             Self: Sized,
     {
         if self.1 { return Ordering::Less; }
         if other.1 { return Ordering::Greater; }
 
-        if self.0.is_dir && !other.0.is_dir { return Ordering::Less; }
-        if !self.0.is_dir && other.0.is_dir { return Ordering::Greater; }
+        match column {
+            ExploreVolumeColumn::Name => {
+                if self.0.is_dir && !other.0.is_dir { return Ordering::Less; }
+                if !self.0.is_dir && other.0.is_dir { return Ordering::Greater; }
 
-        self.0.name.as_ref().unwrap().to_lowercase().cmp(&other.0.name.as_ref().unwrap().to_lowercase())
+                self.0.name.as_ref().unwrap().to_lowercase().cmp(&other.0.name.as_ref().unwrap().to_lowercase())
+            }
+            ExploreVolumeColumn::Size => {
+                other.0.file_size.cmp(&self.0.file_size)
+            }
+        }
     }
 }
 
 fn explore_a_volume_screen(s: &mut Cursive) {
     let mut table = TableView::<(FileMetadata, bool), ExploreVolumeColumn>::new()
-        .column(ExploreVolumeColumn::Name, "Name", |c| c.width_percent(80))
+        .column(ExploreVolumeColumn::Name, "Name", |c| {
+            c.width_percent(80)
+        })
         .column(ExploreVolumeColumn::Size, "Size", |c| {
             c.ordering(Ordering::Greater)
                 .width_percent(20)
@@ -235,17 +249,17 @@ fn explore_a_volume_screen(s: &mut Cursive) {
     }
 
     table.set_on_submit(|s, _row, index| {
-        let f = s
+        let (f, pop_from_stack) = s
             .call_on_name("table", move |table: &mut TableView<(FileMetadata, bool), ExploreVolumeColumn>| {
                 table.borrow_item(index).clone().unwrap().clone()
             })
             .unwrap();
 
         let u = get_user_data(s);
-        if f.1 {
+        if pop_from_stack {
             u.dir_stack.pop();
-        } else if f.0.is_dir {
-            u.dir_stack.push(f.0.index as usize);
+        } else if f.is_dir {
+            u.dir_stack.push(f.index as usize);
         }
 
         explore_a_volume_screen(s);
