@@ -14,9 +14,6 @@ use cursive::view::Resizable;
 
 use std::*;
 use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::path::Path;
 use cursive::utils::Counter;
 use ntfs::KnownNtfsFileRecordNumber::RootDirectory;
 use num_format::{Locale, ToFormattedString};
@@ -24,7 +21,6 @@ use win_dedupe::{FileMetadata, get_mft_entry_count, VolumeIndexFlatArray, Volume
 use anyhow::Result;
 use cursive::view::Nameable;
 use cursive_table_view::{TableView, TableViewItem};
-use phf::phf_map;
 
 use winsafe::{GetLogicalDriveStrings, GetVolumeInformation};
 
@@ -152,7 +148,7 @@ fn explore_a_volume_loading(s: &mut Cursive, path: &str) {
     get_user_data(s).drive_letter = drive_letter;
 
     thread::spawn(move || {
-        let index = VolumeIndexFlatArray::from(&mut reader, Some(counter.0)).unwrap();
+        let index = VolumeIndexFlatArray::from_volume_reader(&mut reader, Some(counter.0)).unwrap();
         cb.send(Box::new(|s| build_tree_loading_screen(s, index))).unwrap();
     });
 }
@@ -250,8 +246,8 @@ fn explore_a_volume_screen(s: &mut Cursive) {
 
     table.set_on_submit(|s, _row, index| {
         let (f, pop_from_stack) = s
-            .call_on_name("table", move |table: &mut TableView<(FileMetadata, bool), ExploreVolumeColumn>| {
-                table.borrow_item(index).clone().unwrap().clone()
+            .call_on_name("table", |table: &mut TableView<(FileMetadata, bool), ExploreVolumeColumn>| {
+                table.borrow_item(index).unwrap().clone()
             })
             .unwrap();
 

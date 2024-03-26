@@ -1,12 +1,12 @@
 use ntfs::Ntfs;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::{
     ffi::c_void,
     io::{Read, Seek, SeekFrom},
     mem::size_of,
     *,
 };
-use std::collections::hash_set::Iter;
+use std::collections::btree_set::Iter;
 use std::io::SeekFrom::Start;
 use std::iter::FilterMap;
 use anyhow::Result;
@@ -16,8 +16,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use mft::attribute::{MftAttributeContent, MftAttributeType};
 use mft::attribute::header::ResidentialHeader::{NonResident, Resident};
 use mft::attribute::x30::FileNamespace::DOS;
+use mft::entry::EntryFlags;
 use mft::MftParser;
-use ntfs::KnownNtfsFileRecordNumber::MFT;
+use ntfs::KnownNtfsFileRecordNumber::{MFT, RootDirectory};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE};
 use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_BEGIN, FILE_END, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, GetFileType, OPEN_EXISTING, ReadFile, SetFilePointerEx};
@@ -31,11 +32,12 @@ pub struct FileMetadata {
     pub name: Option<String>,
     pub index: u64,
     // Because hard links exist, a file can have multiple parent directories
-    pub parent_indices: HashSet<u64>,
+    pub parent_indices: BTreeSet<usize>,
     pub is_dir: bool,
     pub file_size: u64,
     pub allocated_size: u64,
-    pub children_indices: HashSet<u64>,
+    pub children_indices: BTreeSet<usize>,
+    pub children_size: u64,
 }
 
 // Win32 only handles disk IO that is sector aligned and operates on whole sectors
@@ -171,7 +173,7 @@ impl Drop for VolumeReader {
     }
 }
 
-fn verify_ntfs_system_id(reader: &mut VolumeReader) -> bool {
+fn verify_ntfs_system_id<T: Read + Seek>(reader: &mut T) -> bool {
     // Read 8 byte system ID, should be "NTFS    "
     let mut buf = [0u8; 8];
     reader.seek(Start(3)).unwrap();
@@ -182,17 +184,10 @@ fn verify_ntfs_system_id(reader: &mut VolumeReader) -> bool {
 pub struct VolumeIndexFlatArray(pub Vec<Option<FileMetadata>>);
 
 impl VolumeIndexFlatArray {
-    pub fn from(reader: &mut VolumeReader, progress_counter: Option<Arc<AtomicUsize>>) -> Result<Self> {
+    pub fn from_mft_reader<T: Read + Seek>(reader: &mut T, progress_counter: Option<Arc<AtomicUsize>>) -> VolumeIndexFlatArray {
         let mut file_metadata: Vec<Option<FileMetadata>>;
 
-        assert!(verify_ntfs_system_id(reader));
-
-        let fs = Ntfs::new(reader)?;
-        let file = fs.file(reader, MFT as u64)?;
-        let data = file.data(reader, "").unwrap()?;
-        let data_attr = data.to_attribute()?;
-        let mft_reader = data_attr.value(reader)?.attach(reader);
-        let mut mft = MftParser::from_read_seek(mft_reader, None)?;
+        let mut mft = MftParser::from_read_seek(reader, None).unwrap();
 
         let entry_count = mft.get_entry_count();
         file_metadata = vec![None::<FileMetadata>; entry_count as usize];
@@ -202,11 +197,11 @@ impl VolumeIndexFlatArray {
 
                 // Files with inode > 24 are ordinary files/directories
                 let mut name = None::<String>;
-                let mut parent_indices = HashSet::new();
-                let mut is_dir = false;
+                let mut parent_indices = BTreeSet::new();
+                let is_dir = e.header.flags.contains(EntryFlags::INDEX_PRESENT);
                 let mut file_size = 0u64;
                 let mut allocated_size = 0u64;
-                let children_indices = HashSet::new();
+                let children_indices = BTreeSet::new();
 
                 for a in e.iter_attributes().filter_map(|attr| attr.ok()) {
                     // Filename (AttrX30) is always resident so we are fine here
@@ -214,9 +209,8 @@ impl VolumeIndexFlatArray {
                     match a.data {
                         MftAttributeContent::AttrX30(a) => {
                             if a.namespace != DOS {
-                                parent_indices.insert(a.parent.entry);
+                                parent_indices.insert(a.parent.entry as usize);
                                 name = Some(a.name);
-                                is_dir = e.is_dir();
                             }
                         }
                         _ => {}
@@ -232,7 +226,7 @@ impl VolumeIndexFlatArray {
                                 }
                                 NonResident(h) => {
                                     // mft crate docs say that valid_data_length and allocated_length are invalid if vcn_first != 0
-                                    // assert_eq!(h.vnc_first, 0);
+                                    // assert_eq!(h.vnc_first, 0);A
                                     file_size = h.file_size;
                                     // When a file is compressed, allocated_length is an even multiple of the compression unit size rather than the cluster size.
                                     allocated_size = h.allocated_length;
@@ -253,6 +247,7 @@ impl VolumeIndexFlatArray {
                     file_size,
                     allocated_size,
                     children_indices,
+                    children_size: 0,
                 });
             }
 
@@ -264,24 +259,92 @@ impl VolumeIndexFlatArray {
             }
         }
 
-        Ok(VolumeIndexFlatArray(file_metadata))
+        VolumeIndexFlatArray(file_metadata)
+    }
+
+    pub fn from_volume_reader(reader: &mut VolumeReader, progress_counter: Option<Arc<AtomicUsize>>) -> Result<Self> {
+        assert!(verify_ntfs_system_id(reader));
+
+        let fs = Ntfs::new(reader)?;
+        let file = fs.file(reader, MFT as u64)?;
+        let data = file.data(reader, "").unwrap()?;
+        let data_attr = data.to_attribute()?;
+        let mut mft_reader = data_attr.value(reader)?.attach(reader);
+
+        Ok(Self::from_mft_reader(&mut mft_reader, progress_counter))
     }
 
     pub fn build_tree(mut self) -> VolumeIndexTree {
+        let mut parent_isnt_dir_count = 0;
         // Build tree by linking parent directories to their children
         for i in 0..self.0.len() {
             if self.0[i].is_some() {
-                let fm = &self.0[i];
-                for parent_index in fm.clone().unwrap().parent_indices.iter() {
-                    self.0[*parent_index as usize]
-                        .as_mut()
-                        .expect("Parent directory should exist")
-                        .children_indices
-                        .insert(i as u64);
+                let fm = &self.0[i].clone();
+                for parent_index in fm.clone().unwrap().parent_indices {
+                    let parent = self.0[parent_index as usize]
+                        .as_ref()
+                        .expect("File refers to nonexistent parent directory. Possible filesystem corruption detected, please run chkdsk on the drive.");
+
+                    let file_name = fm.as_ref().unwrap().name.as_deref().unwrap_or("<no name>");
+                    let file_inode = fm.as_ref().unwrap().index;
+
+                    let parent_name = parent.name.as_deref().unwrap_or("<no name>");
+                    let parent_inode = parent.index;
+
+                    if parent.is_dir
+                    {
+                        self.0[parent_index as usize]
+                            .as_mut()
+                            .unwrap()
+                            .children_indices
+                            .insert(i);
+                    } else {
+//                         println!(
+//                             "File parent isn't directory??????
+// File inode: {}
+// File name: {}
+// Parent inode: {}
+// Parent name: {}
+// ",
+//                             file_inode, file_name,
+//                             parent_inode, parent_name);
+
+                        parent_isnt_dir_count += 1;
+                    }
                 }
             }
         }
 
+        if parent_isnt_dir_count > 0 {
+            eprintln!("[WARN] {} files didn't have directories as parents", parent_isnt_dir_count);
+        }
+
+        // let mut reverse_stack = Vec::<usize>::new();
+        // let mut queue = VecDeque::<usize>::new();
+        // let mut traversed = vec![false; self.0.len()];
+        //
+        // reverse_stack.push(RootDirectory as usize);
+        // queue.push_back(RootDirectory as usize);
+        //
+        // println!("Items in file list: {}", self.0.len());
+        // println!("Items in initial queue: {}", queue.len());
+        //
+        // let mut n = 0;
+        //
+        // while !queue.is_empty() {
+        //     let parent = queue.pop_front().unwrap();
+        //     let children = &self.0[parent].as_ref().unwrap().children_indices;
+        //
+        //     for i in children {
+        //         queue.push_back(*i);
+        //         reverse_stack.push(*i);
+        //         traversed[*i] = true;
+        //     }
+        // }
+        //
+        // println!("Traversal stack size: {}", reverse_stack.len());
+
+        // Calculate
         VolumeIndexTree(self.0)
     }
 }
@@ -289,9 +352,8 @@ impl VolumeIndexFlatArray {
 pub struct VolumeIndexTree(pub Vec<Option<FileMetadata>>);
 
 impl VolumeIndexTree {
-    pub fn dir_children(&self, inode: usize) -> Option<FilterMap<Iter<u64>, fn(&u64) -> Option<&u64>>> {
+    pub fn dir_children(&self, inode: usize) -> Option<FilterMap<Iter<usize>, fn(&usize) -> Option<&usize>>> {
         if let Some(file) = &self.0[inode] {
-            println!("inode {inode} exists");
             // Files with inode > 24 are ordinary files/directories
             return Some(file.children_indices.iter().filter_map(|i| if *i > 24 { Some(i) } else { None }));
         }
